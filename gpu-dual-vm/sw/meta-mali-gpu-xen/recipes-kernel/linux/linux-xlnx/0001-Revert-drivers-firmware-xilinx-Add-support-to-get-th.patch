@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Luca Miccio <luca.miccio@amd.com>
+Date: Sun, 27 Apr 2025 00:00:00 +0000
+Subject: [PATCH] Revert "drivers: firmware: xilinx: Add support to get the
+ image uid info"
+
+Partially reverts commit b75bf5f2d789.
+
+The PDI sysfs interface requires dma_set_mask_and_coherent(32) which
+fails in a Xen domU guest because guest physical memory is not
+reachable with a 32-bit DMA mask.  The firmware driver does not
+otherwise need DMA (it uses SMC calls), so removing the DMA mask
+setup and the PDI sysfs entry allows versal2-firmware to probe in the
+guest, unblocking the clock-controller and reset-controller needed by
+the DisplayPort drivers.
+
+Signed-off-by: Luca Miccio <luca.miccio@amd.com>
+---
+ drivers/firmware/xilinx/zynqmp-core.c | 13 -------------
+ 1 file changed, 13 deletions(-)
+
+diff --git a/drivers/firmware/xilinx/zynqmp-core.c b/drivers/firmware/xilinx/zynqmp-core.c
+index 0977d351cbc4..62740d6d3cd1 100644
+--- a/drivers/firmware/xilinx/zynqmp-core.c
++++ b/drivers/firmware/xilinx/zynqmp-core.c
+@@ -897,12 +897,6 @@ static int zynqmp_firmware_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+
+-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+-	if (ret < 0) {
+-		dev_err(dev, "no usable DMA configuration");
+-		return ret;
+-	}
+-
+ 	ret = zynqmp_firmware_pm_sysfs_entry(pdev);
+ 	if (ret) {
+ 		pr_err("%s() Failed to create sysfs file with error%d\n",
+@@ -910,13 +904,6 @@ static int zynqmp_firmware_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+
+-	ret = zynqmp_firmware_pdi_sysfs_entry(pdev);
+-	if (ret) {
+-		pr_err("%s() Failed to create sysfs binary file with error%d\n",
+-		       __func__, ret);
+-		return ret;
+-	}
+-
+ 	zynqmp_pm_api_debugfs_init();
+
+ 	if (pm_family_code != PM_ZYNQMP_FAMILY_CODE) {
+--
+2.34.1

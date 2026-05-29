@@ -1,0 +1,136 @@
+From fed804d859424a42c885adcd445d4173f9033c7b Mon Sep 17 00:00:00 2001
+From: Rajesh Gugulothu <rajesh.gugulothu@amd.com>
+Date: Wed, 6 May 2026 19:36:04 +0530
+Subject: [LINUX PATCH] drm: xlnx: hdmi: debounce HPD low to ignore sink-side
+ bounces
+
+Some HDMI sinks pulse HPD low for hundreds of ms during internal
+mode, audio, HDCP or power-management transitions while the link
+stays up.  The IRQ handler runs streamdown_callback() ->
+xlnx_hdmi_reset() on every HPD low, pulsing all four bridge
+resets.  The CDC FIFO loses its pointers, BRIDGE_LOCKED never
+re-asserts and DRM eventually reports a vblank-wait timeout.
+
+Defer the streamdown to a delayed work armed on the falling edge
+with a 1 s debounce.  A rising edge within the window cancels the
+work; in that case skip the inline connect_callback() so the
+active link, FRL state and PHY line rate are preserved.  A real
+cold plug, where no work was pending, still gets the full re-init.
+
+Fixes: 5d06dc5f00af ("drm: xlnx: hdmi: Implement streamdown callback function")
+Signed-off-by: Rajesh Gugulothu <rajesh.gugulothu@amd.com>
+---
+ drivers/gpu/drm/xlnx/xlnx_hdmi.c | 55 ++++++++++++++++++++++++++++----
+ 1 file changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/xlnx/xlnx_hdmi.c b/drivers/gpu/drm/xlnx/xlnx_hdmi.c
+index a0d8741c0c37..26af9932a03a 100644
+--- a/drivers/gpu/drm/xlnx/xlnx_hdmi.c
++++ b/drivers/gpu/drm/xlnx/xlnx_hdmi.c
+@@ -615,6 +615,7 @@ struct xlnx_hdmi {
+ 	struct drm_property *out_fmt;
+ 	u32 out_fmt_prop_val;
+ 	struct delayed_work hdcp_cp_irq_work;
++	struct delayed_work hpd_work;
+ 	struct xlnx_hdcptx txhdcp;
+ 	int hdcp2x_timer_irq;
+ 	int hdcp1x_timer_irq;
+@@ -2041,6 +2042,24 @@ static void xlnx_hdmi_connect_callback(struct xlnx_hdmi *hdmi)
+ 	}
+ }
+ 
++/* HPD low debounce window before triggering streamdown. */
++#define HDMI_HPD_DEBOUNCE_MS	1000
++
++static void xlnx_hdmi_hpd_work_func(struct work_struct *work)
++{
++	struct xlnx_hdmi *hdmi = container_of(to_delayed_work(work),
++					      struct xlnx_hdmi, hpd_work);
++
++	if (READ_ONCE(hdmi->cable_connected))
++		return;
++
++	xlnx_hdmi_streamdown_callback(hdmi);
++	xlnx_hdmi_connect_callback(hdmi);
++
++	if (hdmi->connector.dev)
++		drm_sysfs_hotplug_event(hdmi->connector.dev);
++}
++
+ static void xlnx_hdmi_frl_config(struct xlnx_hdmi *hdmi)
+ {
+ 	union phy_configure_opts phy_cfg = {0};
+@@ -2617,20 +2636,36 @@ static void xlnx_hdmi_piointr_handler(struct xlnx_hdmi *hdmi)
+ 
+ 	/* HPD event has occurred */
+ 	if (event & HDMI_TX_PIO_IN_HPD_CONNECT) {
+-		/* Check the HPD status */
+ 		if (data & HDMI_TX_PIO_IN_HPD_CONNECT) {
++			bool was_bounce;
++
+ 			hdmi->cable_connected = 1;
+ 			hdmi->connector.status = connector_status_connected;
++			/*
++			 * cancel_delayed_work() returns true only if a
++			 * teardown was armed but not yet fired, i.e.
++			 * this is a bounce.  Skip connect_callback() so
++			 * the active link state is preserved.
++			 */
++			was_bounce = cancel_delayed_work(&hdmi->hpd_work);
++			if (was_bounce) {
++				dev_dbg(hdmi->dev, "hpd: high (bounce)\n");
++			} else {
++				dev_dbg(hdmi->dev, "hpd: high (cold plug)\n");
++				xlnx_hdmi_connect_callback(hdmi);
++			}
++			if (hdmi->connector.dev)
++				drm_sysfs_hotplug_event(hdmi->connector.dev);
++			else
++				dev_dbg(hdmi->dev, "Not sending HOTPLUG.\n");
+ 		} else {
+ 			hdmi->cable_connected = 0;
+ 			hdmi->connector.status = connector_status_disconnected;
+-			xlnx_hdmi_streamdown_callback(hdmi);
++			dev_dbg(hdmi->dev, "hpd: low; debounce armed\n");
++			/* Rising edge within the window cancels this. */
++			mod_delayed_work(system_wq, &hdmi->hpd_work,
++					 msecs_to_jiffies(HDMI_HPD_DEBOUNCE_MS));
+ 		}
+-		xlnx_hdmi_connect_callback(hdmi);
+-		if (hdmi->connector.dev)
+-			drm_sysfs_hotplug_event(hdmi->connector.dev);
+-		else
+-			dev_dbg(hdmi->dev, "Not sending HOTPLUG.\n");
+ 	}
+ 
+ 	/* Bridge Unlocked event has occurred */
+@@ -3051,6 +3086,8 @@ static void xlnx_hdmi_encoder_disable(struct drm_encoder *encoder)
+ 	struct xlnx_hdmi *hdmi = encoder_to_hdmi(encoder);
+ 	struct xlnx_hdmi_config *config = &hdmi->config;
+ 
++	cancel_delayed_work_sync(&hdmi->hpd_work);
++
+ 	if (hdmi->bridge)
+ 		xlnx_bridge_disable(hdmi->bridge);
+ 
+@@ -3987,6 +4024,8 @@ static int xlnx_hdmi_probe(struct platform_device *pdev)
+ 		goto error_phy;
+ 	}
+ 
++	INIT_DELAYED_WORK(&hdmi->hpd_work, xlnx_hdmi_hpd_work_func);
++
+ 	/* Request the interrupt */
+ 	ret = devm_request_threaded_irq(hdmi->dev, hdmi->irq,
+ 					hdmitx_irq_handler, hdmitx_irq_thread,
+@@ -4052,6 +4091,8 @@ static void xlnx_hdmi_remove(struct platform_device *pdev)
+ 	if (hdmi->config.vid_interface)
+ 		num_clks--;
+ 
++	cancel_delayed_work_sync(&hdmi->hpd_work);
++
+ 	if (hdmi->bridge)
+ 		xlnx_bridge_disable(hdmi->bridge);
+ 
+-- 
+2.34.1
+
