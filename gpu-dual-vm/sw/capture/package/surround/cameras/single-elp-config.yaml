@@ -1,4 +1,0 @@
-cameras:
-  - camera:
-    position: Front
-    bus: usb-0000:04:00.1-3
